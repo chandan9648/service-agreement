@@ -24,6 +24,8 @@ import type { ServiceAgreementData } from "@/app/types/service-agreement";
 
 import { validateServiceAgreement } from "@/app/lib/validation/service-agreement";
 
+import { convertDocxToPdfWithConvertApi } from "@/app/lib/pdf/convertapi";
+
 
 
 export const runtime = "nodejs";
@@ -788,12 +790,165 @@ async function convertDocxToPdfWithExternalService(
 }
 
 /**
+ * Convert DOCX to PDF through ConvertAPI.
+ *
+ * This is the production path for Netlify, where LibreOffice
+ * is not installed and cannot be executed.
+ *
+ * Required environment variable:
+ *
+ * CONVERTAPI_API_TOKEN=your-convertapi-production-token
+ *
+ * The actual HTTP call lives in the reusable server-side module
+ * app/lib/pdf/convertapi.ts so that any other API route can use
+ * the same conversion without duplicating the logic. This
+ * function is only the file-based adapter around it, matching
+ * the signature of the other converters in this route.
+ */
+async function convertDocxToPdfWithConvertApiService(
+  docxPath: string,
+  pdfPath: string,
+): Promise<void> {
+  const docxBuffer = await fs.readFile(docxPath);
+
+  if (docxBuffer.length === 0) {
+    throw new Error(
+      "Generated DOCX is empty and cannot be converted.",
+    );
+  }
+
+  const pdfBuffer = await convertDocxToPdfWithConvertApi(
+    docxBuffer,
+    path.basename(docxPath),
+  );
+
+  await fs.writeFile(
+    pdfPath,
+    pdfBuffer,
+  );
+
+  console.log(
+    "[Service Agreement] ConvertAPI PDF created successfully.",
+    {
+      size: pdfBuffer.length,
+    },
+  );
+}
+
+/**
+ * Resolve which DOCX -> PDF provider should be used.
+ *
+ * The selection is explicit and ordered:
+ *
+ * 1. PDF_CONVERTER_PROVIDER forces a provider
+ *    ("libreoffice" | "convertapi" | "external").
+ * 2. PDF_CONVERTER_URL keeps the existing self-hosted
+ *    Gotenberg-style converter working wherever it is set.
+ * 3. On Netlify, ConvertAPI is always used. LibreOffice is
+ *    never executed there.
+ * 4. A production build with a ConvertAPI token uses ConvertAPI.
+ * 5. Everything else (local development) uses local LibreOffice.
+ */
+type PdfConverterProvider =
+  | "libreoffice"
+  | "convertapi"
+  | "external";
+
+function resolvePdfConverterProvider(): PdfConverterProvider {
+  /**
+   * Netlify sets NETLIFY=true in its build/runtime environment.
+   */
+  const isNetlify =
+    process.env.NETLIFY === "true" ||
+    Boolean(process.env.NETLIFY);
+
+  const isProduction =
+    process.env.NODE_ENV === "production";
+
+  const hasExternalConverter =
+    Boolean(process.env.PDF_CONVERTER_URL?.trim());
+
+  const hasConvertApiToken =
+    Boolean(process.env.CONVERTAPI_API_TOKEN?.trim());
+
+  /**
+   * Explicit override.
+   *
+   * This is what makes it possible to test the production
+   * ConvertAPI path locally without faking NODE_ENV.
+   */
+  const override =
+    process.env.PDF_CONVERTER_PROVIDER?.trim().toLowerCase();
+
+  if (override) {
+    if (
+      override === "libreoffice" ||
+      override === "convertapi" ||
+      override === "external"
+    ) {
+      /**
+       * IMPORTANT:
+       * Even when forced, LibreOffice must never be executed on
+       * Netlify. There is no
+       *
+       * C:\Program Files\LibreOffice\program\soffice.com
+       *
+       * and no Linux LibreOffice inside a Netlify function.
+       */
+      if (override === "libreoffice" && isNetlify) {
+        throw new Error(
+          "LibreOffice is not available on Netlify. " +
+            "Remove PDF_CONVERTER_PROVIDER=libreoffice and set " +
+            "CONVERTAPI_API_TOKEN instead.",
+        );
+      }
+
+      return override;
+    }
+
+    throw new Error(
+      `Unknown PDF_CONVERTER_PROVIDER value: "${override}". ` +
+        'Use "libreoffice", "convertapi" or "external".',
+    );
+  }
+
+  /**
+   * Preserve the existing external converter behaviour.
+   */
+  if (hasExternalConverter) {
+    return "external";
+  }
+
+  /**
+   * Netlify always goes through ConvertAPI.
+   */
+  if (isNetlify) {
+    return "convertapi";
+  }
+
+  /**
+   * Any other production build uses ConvertAPI when a token
+   * is configured, and otherwise keeps the previous
+   * local-LibreOffice behaviour (for example a self-hosted
+   * Linux server that has LibreOffice installed).
+   */
+  if (isProduction && hasConvertApiToken) {
+    return "convertapi";
+  }
+
+  return "libreoffice";
+}
+
+/**
  * Convert generated DOCX to PDF.
  *
  * LOCAL DEVELOPMENT:
  *   DOCX -> Local LibreOffice -> PDF
  *
  * NETLIFY PRODUCTION:
+ *   DOCX -> ConvertAPI -> PDF
+ *
+ * OPTIONAL (when PDF_CONVERTER_URL is set):
  *   DOCX -> External PDF converter -> PDF
  *
  * The rest of the API does not need to know which provider was used.
@@ -820,22 +975,18 @@ async function convertDocxToPdf(
   );
 
   /**
-   * Netlify sets NETLIFY=true in its build/runtime environment.
-   *
-   * We also check whether PDF_CONVERTER_URL is configured so the
-   * external provider can be tested locally without pretending
-   * that local LibreOffice is the production provider.
+   * Decide which provider handles this conversion.
    */
-  const isNetlify =
-    process.env.NETLIFY === "true" ||
-    Boolean(process.env.NETLIFY);
+  const provider = resolvePdfConverterProvider();
 
-  const hasExternalConverter =
-    Boolean(process.env.PDF_CONVERTER_URL?.trim());
+  console.log(
+    "[Service Agreement] PDF conversion provider:",
+    provider,
+  );
 
   /**
    * ------------------------------------------------------------
-   * PRODUCTION / EXTERNAL PROVIDER
+   * PRODUCTION / REMOTE PROVIDERS
    * ------------------------------------------------------------
    *
    * IMPORTANT:
@@ -845,15 +996,26 @@ async function convertDocxToPdf(
    *
    * from Netlify.
    */
-  if (isNetlify || hasExternalConverter) {
-    console.log(
-      "[Service Agreement] Using external PDF conversion provider.",
-    );
+  if (provider === "external" || provider === "convertapi") {
+    if (provider === "convertapi") {
+      console.log(
+        "[Service Agreement] Using ConvertAPI PDF conversion.",
+      );
 
-    await convertDocxToPdfWithExternalService(
-      docxPath,
-      pdfPath,
-    );
+      await convertDocxToPdfWithConvertApiService(
+        docxPath,
+        pdfPath,
+      );
+    } else {
+      console.log(
+        "[Service Agreement] Using external PDF conversion provider.",
+      );
+
+      await convertDocxToPdfWithExternalService(
+        docxPath,
+        pdfPath,
+      );
+    }
 
     /**
      * Verify the provider actually created a PDF file.
